@@ -1,0 +1,7 @@
+fastapi>=0.110.0
+uvicorn>=0.28.0
+pydantic>=2.6.0
+openai>=1.14.0
+deepeval>=0.21.0
+langsmith>=0.1.20
+pytest>=8.0.0

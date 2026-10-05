@@ -1,0 +1,110 @@
+trigger:
+  branches:
+    include:
+      - main
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: healthcare-llm-secrets # Stores OPENAI_API_KEY, LANGCHAIN_API_KEY
+  - name: ACR_SERVICE_CONNECTION
+    value: 'acr-service-connection'
+  - name: ACR_NAME
+    value: 'hospitalregistry.azurecr.io'
+  - name: IMAGE_REPOSITORY
+    value: 'hospital-llm-assistant'
+  - name: AZURE_SUBSCRIPTION_ARM
+    value: 'azure-arm-connection'
+  - name: RESOURCE_GROUP
+    value: 'rg-healthcare-prod'
+  - name: CONTAINER_APP_NAME
+    value: 'app-hospital-llm-prod'
+
+stages:
+# -------------------------------------------------------------
+# STAGE 1: CI & DEEPEVAL QUALITY GATING
+# -------------------------------------------------------------
+- stage: QualityGate
+  displayName: 'CI: DeepEval & Guardrail Testing'
+  jobs:
+  - job: RunEvals
+    displayName: 'Evaluate LLM Safety and Relevancy'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.11'
+      displayName: 'Setup Python 3.11'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install Test Dependencies'
+
+    - script: |
+        export LANGCHAIN_METADATA='{"build_id": "$(Build.BuildId)", "commit": "$(Build.SourceVersion)", "stage": "CI_QualityGate"}'
+        mkdir -p $(Build.ArtifactStagingDirectory)/test-results
+
+        pytest tests/test_hospital_evals.py \
+          --junitxml=$(Build.ArtifactStagingDirectory)/test-results/eval-results.xml \
+          -v
+      displayName: 'Run DeepEval Suite (Traced via LangSmith)'
+      env:
+        OPENAI_API_KEY: $(OPENAI_API_KEY)
+        LANGCHAIN_API_KEY: $(LANGCHAIN_API_KEY)
+        LANGCHAIN_TRACING_V2: 'true'
+        LANGCHAIN_PROJECT: 'hospital-pipeline-ci'
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(Build.ArtifactStagingDirectory)/test-results/eval-results.xml'
+        failTaskOnFailedTests: true
+        testRunTitle: 'DeepEval Quality & Safety Gate'
+      condition: always()
+      displayName: 'Publish Evaluation Results to Azure DevOps'
+
+# -------------------------------------------------------------
+# STAGE 2: CD & PRODUCTION DEPLOYMENT
+# -------------------------------------------------------------
+- stage: DeployProduction
+  displayName: 'CD: Deploy Endpoint to Production'
+  dependsOn: QualityGate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: BuildAndDeploy
+    displayName: 'Build Container & Update Service'
+    steps:
+    - checkout: self
+
+    - task: Docker@2
+      displayName: 'Build & Push Docker Image to ACR'
+      inputs:
+        command: buildAndPush
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        repository: $(IMAGE_REPOSITORY)
+        dockerfile: '**/Dockerfile'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+    - task: AzureCLI@2
+      displayName: 'Deploy Container Revision to Azure'
+      inputs:
+        azureSubscription: $(AZURE_SUBSCRIPTION_ARM)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az containerapp update \
+            --name $(CONTAINER_APP_NAME) \
+            --resource-group $(RESOURCE_GROUP) \
+            --image $(ACR_NAME)/$(IMAGE_REPOSITORY):$(Build.BuildId) \
+            --set-env-vars \
+              OPENAI_API_KEY="$(OPENAI_API_KEY)" \
+              LANGCHAIN_API_KEY="$(LANGCHAIN_API_KEY)" \
+              LANGCHAIN_TRACING_V2="true" \
+              LANGCHAIN_PROJECT="hospital-pipeline-prod"
